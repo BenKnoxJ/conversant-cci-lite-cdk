@@ -1,86 +1,113 @@
-# CCI Lite — Corrected and Final Implementation Plan (Console-Only)
+# CCI Lite — Production Implementation Guide (AWS Console, Step‑by‑Step)
 
-> Region: **eu-central-1** for all core services. **us-east-1** for Bedrock (until local model availability).
-> Single-account, multi-tenant. Designed for deterministic setup and error-free execution.
-
----
-
-## Global Standards
-
-* **Tags:** `Project=CCI-Lite`, `Env=prod`, `Owner=Conversant`, `Data=Voice`
-* **KMS alias:** `alias/cci-lite-master-key`
-* **Buckets:** `cci-lite-input`, `cci-lite-results`
-* **IAM roles:**
-
-  * `cci-lite-lambda-role` (Lambda execution)
-  * `cci-lite-transcribe-role` (Transcribe output role)
-* **S3 prefixes:**
-
-  * Input: `s3://cci-lite-input/<tenant_id>/calls/`
-  * Results: `s3://cci-lite-results/<tenant_id>/YYYY/MM/DD/`
+This guide is a complete, click‑by‑click procedure to deploy **CCI Lite** for production and customer use in AWS, using the **AWS Console**. CLI snippets are provided as optional checks. Follow the sequence exactly.
 
 ---
 
-## Phase 1 — Foundation Setup
+## 0) Scope and Success Criteria
 
-### 1. Create KMS Key
+**Goal:** Upload a call audio file to S3 → automatic transcript → sentiment + AI summary → JSON written to S3 → queryable in Athena → visualised in QuickSight. Multi‑tenant safe. No audio stored long‑term.
 
-**KMS → Create key → Symmetric.**
-Alias: `alias/cci-lite-master-key`. Add your IAM user as administrator.
+**Pass if:**
 
-Then under **Key Users**, add:
-
-* Your IAM user
-* (later) `cci-lite-lambda-role`
-* (later) `cci-lite-transcribe-role`
-
-**Validation:** Key alias appears, and Key Users are visible.
+* Uploading `demo-tenant/calls/sample.wav` triggers a result JSON under `cci-lite-results/demo-tenant/YYYY/MM/DD/<call_id>.json`.
+* Athena returns rows for the file within 5 minutes.
+* QuickSight dashboard refresh shows the new call.
+* CloudWatch Alarms stay green.
 
 ---
 
-### 2. Create S3 Buckets
+## 1) Prerequisites
 
-#### 2.1 `cci-lite-input`
+* AWS account with admin access for initial setup.
+* Region: **eu-central-1** for all resources except **Amazon Bedrock** (use **us-east-1** unless your chosen model is available in eu-central-1).
+* Chosen tenant ID for first deployment, e.g. `demo-tenant`.
+* Test audio file: 8–60 seconds, `.wav` or `.mp3`, G.711/PCM preferred.
 
+**Standard Tags** (apply to every resource):
+
+```
+Project=CCI-Lite, Env=prod, Owner=Conversant, Data=Voice
+```
+
+---
+
+## 2) Create the KMS Key
+
+**Console:** KMS → Create key → Symmetric → Next.
+
+* **Alias:** `alias/cci-lite-master-key`
+* **Key administrators:** your admin user/role.
+* **Key users:** leave empty for now; you will add roles in section 4.
+* Finish creation.
+
+**Validation:** Key appears with the alias and correct administrators.
+
+---
+
+## 3) Create S3 Buckets and Lifecycle
+
+### 3.1 Input bucket
+
+**S3 → Create bucket**
+
+* Name: `cci-lite-input`
 * Region: eu-central-1
-* Block public access: ON
-* Encryption: **SSE-KMS** using `alias/cci-lite-master-key`
-* Lifecycle: `input-retention-1d` → expire current versions after **1 day** and delete markers.
-* Folder: `demo-tenant/calls/`
+* Block Public Access: **On**
+* Default encryption: **SSE-KMS** → select `alias/cci-lite-master-key`
+* Create bucket.
 
-#### 2.2 `cci-lite-results`
+**Lifecycle rule:**
 
+* Name: `input-retention-1d`
+* Current object expiration: **1 day**
+* Expired object delete markers: **Delete** (enabled)
+
+**Create prefix:** `demo-tenant/calls/`
+
+### 3.2 Results bucket
+
+**S3 → Create bucket**
+
+* Name: `cci-lite-results`
 * Region: eu-central-1
-* Encryption: **SSE-KMS** using same key
-* Lifecycle: `results-retention-30d` → expire after **30 days** and delete markers.
-* Folders: `tmp/`, `demo-tenant/`
+* Block Public Access: **On**
+* Default encryption: **SSE-KMS** → `alias/cci-lite-master-key`
 
-#### 2.3 Bucket Policies
+**Lifecycle rule:**
 
-**Input bucket:**
+* Name: `results-retention-30d`
+* Current object expiration: **30 days**
+* Expired object delete markers: **Delete** (enabled)
+
+**Create prefixes:** `tmp/` and `demo-tenant/`
+
+### 3.3 Bucket policies
+
+**Input bucket policy** (S3 → Permissions → Bucket policy):
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowLambdaAndUserUploads",
+      "Sid": "AllowLambdaAndUser",
       "Effect": "Allow",
-      "Principal": {
-        "AWS": [
-          "arn:aws:iam::ACCOUNT_ID:user/Ben.Knox-Johnston",
-          "arn:aws:iam::ACCOUNT_ID:role/cci-lite-lambda-role"
-        ]
-      },
-      "Action": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::cci-lite-input", "arn:aws:s3:::cci-lite-input/*"],
+      "Principal": {"AWS": [
+        "arn:aws:iam::ACCOUNT_ID:role/cci-lite-lambda-role"
+      ]},
+      "Action": ["s3:PutObject","s3:GetObject","s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::cci-lite-input",
+        "arn:aws:s3:::cci-lite-input/*"
+      ],
       "Condition": {
         "Bool": {"aws:SecureTransport": "true"},
         "StringEquals": {"s3:x-amz-server-side-encryption": "aws:kms"}
       }
     },
     {
-      "Sid": "DenyUnencryptedOrNonTLS",
+      "Sid": "DenyNonTLSorUnencrypted",
       "Effect": "Deny",
       "Principal": "*",
       "Action": "s3:PutObject",
@@ -94,89 +121,111 @@ Then under **Key Users**, add:
 }
 ```
 
-**Results bucket:** similar but no deny block required.
-
-**Validation:** Upload a file manually. Confirm `aws:kms` encryption. CLI upload without SSE-KMS → denied.
-
----
-
-### 3. IAM Roles
-
-#### 3.1 Lambda Role: `cci-lite-lambda-role`
-
-**Permissions (initial):**
-
-* `AmazonS3FullAccess`
-* `CloudWatchLogsFullAccess`
-
-After first test, replace with:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": ["arn:aws:s3:::cci-lite-*/*"]},
-    {"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*"},
-    {"Effect": "Allow", "Action": ["transcribe:*", "comprehend:*"], "Resource": "*"},
-    {"Effect": "Allow", "Action": ["bedrock:InvokeModel"], "Resource": "*"}
-  ]
-}
-```
-
-#### 3.2 Transcribe Role: `cci-lite-transcribe-role`
-
-Required for Transcribe to write job output.
+**Results bucket policy** (allow Transcribe to write temporary output):
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowTranscribeWritesTmp",
       "Effect": "Allow",
       "Principal": {"Service": "transcribe.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    },
-    {
-      "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::cci-lite-results/*"
+      "Resource": "arn:aws:s3:::cci-lite-results/tmp/*"
     }
   ]
 }
 ```
 
-**Add both roles as Key Users** in KMS.
+**Validation:** Try a manual upload without SSE‑KMS → denied. With SSE‑KMS → allowed.
 
 ---
 
-### 4. Parameter Store
+## 4) Create IAM Roles (Least Privilege)
 
-**/cci-lite/config/models**:
+### 4.1 `cci-lite-lambda-role`
 
-```json
-{"bedrock_model_summary": "anthropic.claude-3-haiku-20240307", "bedrock_region": "us-east-1"}
-```
-
-**/cci-lite/config/tenants/demo-tenant**:
+**Console:** IAM → Roles → Create role → Trusted entity: **AWS service** → Lambda.
+Attach a **custom policy** `CCI-Lite-Lambda-Policy`:
 
 ```json
-{"tenant_id": "demo-tenant", "retention_days_results": 30, "retention_days_input": 1}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:GetObject","s3:PutObject"], "Resource": [
+      "arn:aws:s3:::cci-lite-input/*",
+      "arn:aws:s3:::cci-lite-results/*"
+    ]},
+    {"Effect": "Allow", "Action": ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"], "Resource": "*"},
+    {"Effect": "Allow", "Action": ["transcribe:StartTranscriptionJob","transcribe:GetTranscriptionJob"], "Resource": "*"},
+    {"Effect": "Allow", "Action": ["comprehend:DetectSentiment"], "Resource": "*"},
+    {"Effect": "Allow", "Action": ["bedrock:InvokeModel"], "Resource": "*"}
+  ]
+}
 ```
 
-**Phase 1 Complete. Do not configure CloudWatch or QuickSight yet.**
+Create role and attach the policy.
+
+### 4.2 `cci-lite-transcribe-role`
+
+**Console:** IAM → Roles → Create role → Trusted entity: **Custom trust policy** → paste:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow","Principal": {"Service": "transcribe.amazonaws.com"},"Action": "sts:AssumeRole"}
+  ]
+}
+```
+
+Attach inline policy `CCI-Lite-Transcribe-WriteResults`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow","Action": ["s3:PutObject"],"Resource": "arn:aws:s3:::cci-lite-results/tmp/*"}
+  ]
+}
+```
+
+### 4.3 Grant KMS key usage
+
+KMS → the key → **Key users** → add both roles above.
+
+**Validation:** KMS key shows the two roles under Key users.
 
 ---
 
-## Phase 2 — Core Pipeline
+## 5) Parameter Store (optional but recommended)
 
-### 1. Lambda Function `cci-lite-processor`
+**Systems Manager → Parameter Store → Create parameter**
 
-**Runtime:** Python 3.12
-**Memory:** 1024 MB
-**Timeout:** 5 minutes
-**Trigger:** S3 event (suffix: `.wav`, `.mp3`) on `cci-lite-input`
+* Name: `/cci-lite/config/models`
+* Type: String
+* Value:
 
-**Env Vars:**
+```json
+{"bedrock_model_summary":"anthropic.claude-3-haiku-20240307","bedrock_region":"us-east-1"}
+```
+
+* Repeat per tenant as needed: `/cci-lite/config/tenants/demo-tenant`.
+
+---
+
+## 6) Create the Lambda Function
+
+**Console:** Lambda → Create function → Author from scratch.
+
+* Name: `cci-lite-processor`
+* Runtime: **Python 3.12**
+* Architecture: arm64 or x86_64
+* Execution role: **Use existing** → `cci-lite-lambda-role`
+* Create.
+
+**Configuration → Environment variables:**
 
 ```
 INPUT_BUCKET=cci-lite-input
@@ -187,123 +236,267 @@ MODEL_ID_CLAUDE=anthropic.claude-3-haiku-20240307
 TRANSCRIBE_ROLE_ARN=arn:aws:iam::ACCOUNT_ID:role/cci-lite-transcribe-role
 ```
 
-**Code:**
+**General configuration:**
+
+* Memory: **1024 MB**
+* Timeout: **5 minutes**
+* Ephemeral storage: default is fine.
+
+**Code (index.py):**
 
 ```python
-import json, os, time, boto3
+import json, os, time, boto3, urllib.parse
 s3 = boto3.client('s3')
 transcribe = boto3.client('transcribe')
 comprehend = boto3.client('comprehend')
 bedrock = boto3.client('bedrock-runtime', region_name=os.environ['BEDROCK_REGION'])
 
+OUTPUT_BUCKET = os.environ['OUTPUT_BUCKET']
+INPUT_BUCKET = os.environ['INPUT_BUCKET']
+TMP_PREFIX = os.environ['TMP_PREFIX']
+MODEL_ID = os.environ['MODEL_ID_CLAUDE']
+TRANSCRIBE_ROLE_ARN = os.environ['TRANSCRIBE_ROLE_ARN']
+
 def lambda_handler(event, context):
     record = event['Records'][0]
-    key = record['s3']['object']['key']
+    key = urllib.parse.unquote(record['s3']['object']['key'])
     tenant = key.split('/')[0]
-    call_id = key.split('/')[-1].split('.')[0]
+    call_id = key.split('/')[-1].rsplit('.', 1)[0]
 
     job_name = f"cci-lite-{int(time.time())}-{call_id}"
-    media_uri = f"s3://{os.environ['INPUT_BUCKET']}/{key}"
+    media_uri = f"s3://{INPUT_BUCKET}/{key}"
 
     transcribe.start_transcription_job(
         TranscriptionJobName=job_name,
         Media={'MediaFileUri': media_uri},
         IdentifyLanguage=True,
-        OutputBucketName=os.environ['OUTPUT_BUCKET'],
-        OutputKey=f"{os.environ['TMP_PREFIX']}{tenant}/{job_name}/",
+        OutputBucketName=OUTPUT_BUCKET,
+        OutputKey=f"{TMP_PREFIX}{tenant}/{job_name}/",
         OutputEncryptionKMSKeyId='alias/cci-lite-master-key',
-        DataAccessRoleArn=os.environ['TRANSCRIBE_ROLE_ARN']
+        DataAccessRoleArn=TRANSCRIBE_ROLE_ARN
     )
 
     while True:
-        status = transcribe.get_transcription_job(TranscriptionJobName=job_name)
-        s = status['TranscriptionJob']['TranscriptionJobStatus']
-        if s in ('COMPLETED', 'FAILED'):
+        resp = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+        status = resp['TranscriptionJob']['TranscriptionJobStatus']
+        if status in ('COMPLETED','FAILED'):
             break
         time.sleep(5)
 
-    if s == 'COMPLETED':
-        transcript_uri = status['TranscriptionJob']['Transcript']['TranscriptFileUri']
-        tr_data = json.loads(s3.get_object(Bucket=os.environ['OUTPUT_BUCKET'], Key=f"{os.environ['TMP_PREFIX']}{tenant}/{job_name}/transcription.json")['Body'].read())
-        text = tr_data['results']['transcripts'][0]['transcript']
+    if status != 'COMPLETED':
+        raise RuntimeError(f"Transcription failed: {resp}")
 
-        sentiment = comprehend.detect_sentiment(Text=text, LanguageCode='en')
+    tmp_key = f"{TMP_PREFIX}{tenant}/{job_name}/transcription.json"
+    tr_data = json.loads(s3.get_object(Bucket=OUTPUT_BUCKET, Key=tmp_key)['Body'].read())
+    text = tr_data['results']['transcripts'][0]['transcript'] if tr_data['results']['transcripts'] else ''
 
-        prompt = f"Summarise this call:\n{text}\nReturn JSON with summary, sentiment, and action items."
-        br_resp = bedrock.invoke_model(
-            modelId=os.environ['MODEL_ID_CLAUDE'],
-            body=json.dumps({"prompt": prompt, "max_tokens": 500})
-        )
-        ai_output = json.loads(br_resp['body'].read())
+    sent = comprehend.detect_sentiment(Text=text[:4500], LanguageCode='en')
 
-        final = {
-            "tenant": tenant,
-            "call_id": call_id,
-            "summary": ai_output.get('completion', ''),
-            "sentiment": sentiment,
-            "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-        }
+    prompt = (
+        "Return JSON with keys: summary, action_items[] (strings), risks[] (strings).\n"
+        "Text:" + text[:12000]
+    )
+    br = bedrock.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps({"prompt": prompt, "max_tokens": 600})
+    )
+    br_payload = json.loads(br['body'].read())
+    ai_summary = br_payload.get('completion') or br_payload
 
-        out_key = f"{tenant}/{time.strftime('%Y/%m/%d')}/{call_id}.json"
-        s3.put_object(Bucket=os.environ['OUTPUT_BUCKET'], Key=out_key, Body=json.dumps(final), ServerSideEncryption='aws:kms')
+    result = {
+        "tenant": tenant,
+        "call_id": call_id,
+        "summary": ai_summary,
+        "sentiment": sent,
+        "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    }
 
-        return {"status": "success", "result_key": out_key}
-    else:
-        raise Exception(f"Transcription failed: {status}")
+    out_key = f"{tenant}/{time.strftime('%Y/%m/%d')}/{call_id}.json"
+    s3.put_object(Bucket=OUTPUT_BUCKET, Key=out_key, Body=json.dumps(result), ServerSideEncryption='aws:kms')
+
+    return {"ok": True, "result_key": out_key}
 ```
 
-**Validation:** Upload a short `.wav` file to `demo-tenant/calls/` and verify a JSON result under `cci-lite-results/demo-tenant/YYYY/MM/DD/`.
+**Save** and **Deploy**.
 
 ---
 
-### 2. CloudWatch
+## 7) Configure S3 Event Trigger
 
-After first successful test, enable:
+S3 → `cci-lite-input` → **Properties** → Event notifications → Create event notification.
 
-* Log retention: 30 days
-* Alarms:
+* Name: `on-audio-upload`
+* Event types: **PUT**
+* Prefix: `demo-tenant/calls/`
+* Suffix: `.wav` and repeat for `.mp3` (create 2 notifications) **or** use one rule without suffix but filter in code.
+* Destination: **Lambda function** → `cci-lite-processor`.
 
-  * `Errors > 0`
-  * `Duration > 250000 ms`
-
----
-
-## Phase 3 — Data Cataloging & Analytics
-
-1. Create Glue Database: `cci_lite`
-2. Create Glue Crawler pointing to `s3://cci-lite-results/`
-
-   * Include all tenants.
-   * Schedule: manual (for now).
-3. Run crawler once → verify Athena table creation.
-4. Athena: confirm `summary`, `sentiment`, and `timestamp` columns.
-5. QuickSight: connect to Athena dataset and build visuals.
+**Validation:** Lambda shows the S3 trigger in its Triggers tab.
 
 ---
 
-## Phase 4 — Observability
+## 8) First End‑to‑End Test
 
-* Structured logging with JSON.
-* Include `call_id`, `tenant`, `status`, and `duration_ms` per execution.
-* Enable basic dashboard in CloudWatch Metrics.
+1. Upload `sample.wav` to `s3://cci-lite-input/demo-tenant/calls/`.
+2. CloudWatch Logs → `cci-lite-processor` log group → confirm no errors.
+3. S3 → `cci-lite-results/demo-tenant/YYYY/MM/DD/` → verify `<call_id>.json` exists.
 
----
-
-## Phase 5 — SaaS Readiness
-
-* Parameterize tenant IDs.
-* Introduce optional API Gateway endpoint for file uploads.
-* Add per-tenant quotas and cost alerts via AWS Budgets.
+**Expected JSON keys:** `tenant, call_id, summary, sentiment, timestamp`.
 
 ---
 
-## Phase 6 — Validation Checklist
+## 9) CloudWatch Log Retention and Alarms
 
-* ✅ File upload triggers Lambda automatically.
-* ✅ Transcribe output written to results bucket.
-* ✅ Sentiment + summary JSON created.
-* ✅ Queryable in Athena.
-* ✅ QuickSight visual refresh works.
-* ✅ CloudWatch metrics normal.
+**Logs:** Lambda → Monitor → Logs → Set retention to **30 days**.
 
-**At this stage, CCI Lite is production-ready and conforms to AWS security and compliance best practices.**
+**Alarms:** CloudWatch → Alarms → Create
+
+* `LambdaErrorsHigh`: Metric = **Errors**, Statistic = Sum, Period = 5m, Threshold > 0 for 2 datapoints.
+* `LambdaDurationHigh`: Metric = **Duration**, Threshold > 250000 ms for 2 datapoints.
+  Notification to your SNS topic or email.
+
+---
+
+## 10) Glue + Athena (Data Catalog)
+
+**Glue Database:** `cci_lite`
+
+**Crawler:**
+
+* Data source: `s3://cci-lite-results/`
+* IAM role: auto‑created or a dedicated Glue role with read on results bucket.
+* Target database: `cci_lite`
+* Run **once**.
+
+**Athena:**
+
+* Workgroup: primary
+* Query: `SELECT tenant, call_id, timestamp FROM "cci_lite"."cci_lite_results" ORDER BY timestamp DESC LIMIT 10;`
+
+**Validation:** At least one row appears for your test call.
+
+---
+
+## 11) QuickSight Dashboard
+
+* QuickSight → Manage data → New dataset → **Athena** → choose the table created by the crawler.
+* Import to SPICE or Direct Query.
+* Build visuals: calls by day, average sentiment score, word cloud from summary terms (optional).
+* Schedule refresh.
+
+---
+
+## 12) Hardening for Production
+
+* Replace broad IAM with least‑privilege policies shown above.
+* S3 Block Public Access: **On** for both buckets.
+* KMS key policy review; limit admins; enable key rotation.
+* Add **AWS Budgets**: monthly cost alert for Transcribe, Comprehend, Bedrock.
+* Enable CloudTrail and GuardDuty in the account.
+* Optionally put Lambda in a VPC and use **Gateway/Interface VPC Endpoints** for S3, Logs, STS, Bedrock (where supported).
+* Enable CloudWatch log **metric filters** for `ERROR` strings in logs.
+
+---
+
+## 13) Multi‑Tenant Onboarding Procedure
+
+**For each new tenant `<tenant_id>`:**
+
+1. Create prefixes: `cci-lite-input/<tenant_id>/calls/` and `cci-lite-results/<tenant_id>/`.
+2. Add or adjust S3 event notification prefix if you isolate per tenant; otherwise keep single rule.
+3. Optionally store `/cci-lite/config/tenants/<tenant_id>` in Parameter Store.
+4. Validate by uploading a short test file.
+
+**Data isolation model:** All tenant data is separated by S3 prefixes. If exposing externally, add S3 Access Points per tenant and IAM conditions on `s3:prefix`.
+
+---
+
+## 14) Cost Controls
+
+* S3 lifecycle already deletes input after 1 day and results after 30 days.
+* Budgets: Alerts at 50%, 80%, 100% of monthly target.
+* Optional Lambda **reserved concurrency** to cap spend.
+* Use **smaller Bedrock model** for summaries if quality is acceptable.
+
+---
+
+## 15) Operations Runbooks
+
+**A. Transcribe job stuck in IN_PROGRESS**
+
+* Check IAM `cci-lite-transcribe-role` trust and S3 permissions on `cci-lite-results/tmp/`.
+* Confirm KMS key grants to Transcribe role.
+
+**B. Lambda access denied to S3**
+
+* Verify bucket policy and Lambda role permissions.
+* Ensure SSE‑KMS used and Lambda role is a Key user.
+
+**C. Empty transcript or wrong language**
+
+* Confirm audio codec and clarity; IdentifyLanguage is enabled; try a longer sample.
+
+**D. Bedrock `AccessDeniedException`**
+
+* Ensure model access is granted in Bedrock; region set to `us-east-1` env var.
+
+**E. Athena table missing columns**
+
+* Rerun Glue crawler; ensure sample JSONs exist; check partition projection if added later.
+
+---
+
+## 16) Production Readiness Checklist
+
+* [ ] All resources tagged.
+* [ ] KMS key with rotation and least‑privilege.
+* [ ] Buckets encrypted, lifecycle rules active, public access blocked.
+* [ ] IAM policies least‑privilege and reviewed.
+* [ ] S3 event notifications working.
+* [ ] Lambda memory/timeout sized for typical file length.
+* [ ] Alarms configured and tested.
+* [ ] Glue, Athena, QuickSight pipeline working.
+* [ ] Budgets created; alerts received in email/SNS.
+* [ ] Runbooks documented and stored.
+
+---
+
+## 17) Rollback Plan
+
+* Disable S3 event notifications to stop processing.
+* Set Lambda **reserved concurrency = 0** to halt invocation.
+* Remove Alarms and budget alerts after decommission.
+* Delete Glue crawler and database if not reused.
+* Empty and delete S3 buckets; then **schedule KMS key deletion** (with a waiting period).
+
+---
+
+## 18) Appendices
+
+### A) Result JSON (minimum schema)
+
+```json
+{
+  "tenant": "demo-tenant",
+  "call_id": "a1b2c3",
+  "summary": "...",
+  "sentiment": {"Sentiment": "NEUTRAL", "SentimentScore": {"Positive":0.01,"Negative":0.02,"Neutral":0.95,"Mixed":0.02}},
+  "timestamp": "2025-11-05T12:00:00Z"
+}
+```
+
+### B) Optional CLI sanity checks
+
+```bash
+aws s3 ls s3://cci-lite-input/demo-tenant/calls/
+aws logs tail /aws/lambda/cci-lite-processor --since 1h
+aws athena start-query-execution --query-string "SELECT count(*) FROM \"cci_lite\".\"cci_lite_results\";" --work-group primary
+```
+
+### C) Supported audio hints
+
+* Prefer 8 kHz or 16 kHz PCM WAV. Keep under 30 MB for quick tests.
+
+---
+
+**Done. Follow the steps in order. Use the checklist before go‑live.**

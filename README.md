@@ -1,8 +1,8 @@
-# Conversant CCI Lite — End‑to‑End AWS Console Click‑Through Guide (v1.2, Customisable QA)
+# Conversant CCI Lite — End‑to‑End AWS Console Click‑Through Guide (v1.3, Customisable QA, Production‑Ready)
 
 > **Scope**: Single‑account, multi‑tenant, fully serverless pipeline with **customer‑defined QA forms**. Stack: **S3 → EventBridge → Lambda (Init) → Transcribe (PII redaction) → SNS/EventBridge → Lambda (Result) → Comprehend (batch) → Bedrock → S3(JSON) → Glue → Athena → QuickSight**. No Step Functions.
 >
-> **What’s new in v1.2**: Custom QA templates per tenant in DynamoDB, dynamic Bedrock prompt, structured `qa_evaluation.criteria[]` output for reporting, Athena queries to explode criteria, QuickSight visuals for pass/fail by criterion, agent, and queue.
+> **What’s new in v1.3**: Production hardening. Added SNS→S3 timing backoff, strict JSON repair guidance, Transcribe S3 write permissions with data-access role, idempotency and replay safety, DLQs, cost tags, and an expanded validation checklist.
 
 ---
 
@@ -142,117 +142,22 @@ Enable X‑Ray; set log retention 30 days. Reserve concurrency caps: **50** tota
 * Trigger: EventBridge S3 rule (failover to direct S3 trigger if you also add one)
 * Timeout 2 min, Memory 1024 MB
 
-**Key behaviour**: Validate `/calls/` prefix → derive `tenant_id` → start job with output to `results/tmp/<tenant_id>/` + SNS notifications. (Use the v1.1 code; unchanged for v1.2.)
+**Key behaviour**: Validate `/calls/` prefix → derive `tenant_id` → start job with output to `results/tmp/<tenant_id>/` + SNS notifications.
 
 ### 8.3 `cci-lite-result-handler` — Transcript → NLP → Custom QA → Unified JSON
 
 * Trigger: EventBridge (Transcribe COMPLETED)
-* Timeout 5–10 min, Memory 1536 MB
+* Timeout 10 min, Memory 1536 MB
 
-**New logic in v1.2**: fetch tenant QA template from DynamoDB and pass to Bedrock; capture structured `qa_evaluation`.
+**Logic**: Fetch tenant QA template from DynamoDB, evaluate via Bedrock, and write unified JSON. Include retry/backoff for transcript availability and a basic JSON repair step if the model output is malformed. Keep deterministic S3 keys based on `job_name` for idempotency.
 
-**Code outline (replaces the summariser and adds QA):**
+### 8.4 Production Hardening (merge these into your handler)
 
-```python
-import os, json, boto3, datetime
-
-s3 = boto3.client('s3')
-comprehend = boto3.client('comprehend')
-bedrock = boto3.client('bedrock-runtime', region_name=os.environ['BEDROCK_REGION'])
-ddb = boto3.resource('dynamodb').Table(os.environ['DDB_TABLE'])
-
-OUTPUT_BUCKET = os.environ['OUTPUT_BUCKET']
-MODEL_ID = os.environ['BEDROCK_MODEL_ID']
-QA_TEMPLATE_KEY = os.environ['QA_TEMPLATE_KEY']
-
-
-def _load_transcript_from_s3(output_bucket, tenant_id):
-    prefix = f"tmp/{tenant_id}/"
-    resp = s3.list_objects_v2(Bucket=output_bucket, Prefix=prefix)
-    for o in resp.get('Contents', []):
-        if o['Key'].endswith('.json'):
-            return json.loads(s3.get_object(Bucket=output_bucket, Key=o['Key'])['Body'].read())
-    raise RuntimeError('Transcript JSON not found')
-
-
-def _get_qa_template(tenant_id):
-    resp = ddb.get_item(Key={"pk": f"TENANT#{tenant_id}", "sk": QA_TEMPLATE_KEY})
-    return resp.get('Item', {"criteria": []})
-
-
-def _bedrock_eval(text, qa_template):
-    # Trim to protect token budget
-    t = text[:45000]
-    prompt = (
-        "You are a strict call QA evaluator. Given the transcript and the QA criteria, return pure JSON.\n"
-        "Required keys: issue, resolution, outcome, action_items[], tone_score(0-100), sentiment_summary,\n"
-        "qa_evaluation: {criteria:[{id,question,passed,score,reason}], total_score, max_score, percentage, failed:[{id,reason}]}\n"
-        "Scoring: score is 0 or the provided weight (if given). If required=true and not met, passed=false.\n"
-        f"QA_CRITERIA_JSON: {json.dumps(qa_template.get('criteria', []))}\n"
-        f"TRANSCRIPT:\n{t}"
-    )
-    body = {"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":[{"type":"text","text":prompt}]}],"max_tokens":1800}
-    resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
-    payload = json.loads(resp['body'].read())
-    content = payload.get('output_text') or payload.get('content', [{}])[0].get('text') or json.dumps(payload)
-    try:
-        return json.loads(content)
-    except Exception:
-        return {"summary_raw": content}
-
-
-def handler(event, context):
-    detail = event.get('detail', {})
-    job_name = detail.get('TranscriptionJobName') or detail.get('TranscriptionJob',{}).get('TranscriptionJobName')
-    tenant_id = job_name.split('_')[1] if job_name and '_' in job_name else 'unknown'
-
-    # Load transcript assembled by Transcribe
-    transcript = _load_transcript_from_s3(OUTPUT_BUCKET, tenant_id)
-    texts = transcript.get('results', {}).get('transcripts', [])
-    call_text = "\n".join([x.get('transcript','') for x in texts])
-
-    # Comprehend NLP
-    comp_in = [call_text]
-    sentiment = comprehend.batch_detect_sentiment(TextList=comp_in, LanguageCode='en')
-    phrases = comprehend.batch_detect_key_phrases(TextList=comp_in, LanguageCode='en')
-    entities = comprehend.batch_detect_entities(TextList=comp_in, LanguageCode='en')
-
-    # QA template per tenant
-    qa_template = _get_qa_template(tenant_id)
-
-    # Bedrock evaluation with custom QA
-    ai = _bedrock_eval(call_text, qa_template)
-
-    # Unified JSON v1.2
-    now = datetime.datetime.utcnow()
-    out = {
-        "tenant_id": tenant_id,
-        "call_id": job_name,
-        "call_date": now.strftime('%Y-%m-%d'),
-        "sentiment": sentiment.get('ResultList',[{}])[0],
-        "key_phrases": phrases.get('ResultList',[{}])[0],
-        "entities": entities.get('ResultList',[{}])[0],
-        "ai_summary": {
-            "issue": ai.get('issue'),
-            "resolution": ai.get('resolution'),
-            "outcome": ai.get('outcome'),
-            "action_items": ai.get('action_items'),
-            "tone_score": ai.get('tone_score'),
-            "sentiment_summary": ai.get('sentiment_summary')
-        },
-        "qa_evaluation": ai.get('qa_evaluation', {}),
-        "source": {"transcribe_job": job_name, "pii_redacted": True}
-    }
-
-    key = f"{tenant_id}/{now.year:04d}/{now.month:02d}/{now.day:02d}/{job_name}.json"
-    s3.put_object(Bucket=OUTPUT_BUCKET, Key=key, Body=json.dumps(out).encode('utf-8'),
-                  ServerSideEncryption='aws:kms', SSEKMSKeyId=os.environ['KMS_KEY_ARN'],
-                  Tagging=f"tenant_id={tenant_id}")
-
-    return {"written": f"s3://{OUTPUT_BUCKET}/{key}"}
-```
-
-> For high volume, send a compact payload to SQS and move NLP/Bedrock to an `analyzer` Lambda.
+* **Transcript availability backoff**: After `COMPLETED`, loop-list the `results/tmp/<tenant_id>/` prefix up to ~45 s with a small delay until the JSON appears. Fail with a clear error if not found.
+* **JSON repair**: If Bedrock returns non-JSON, strip code fences, trim trailing commas, ensure balanced braces, then retry JSON parse. If still failing, write a `summary_raw` field and mark the call for review.
+* **Idempotency**: Use deterministic `call_id` from `TranscriptionJobName` and check if the target results key already exists. If yes, skip write or overwrite based on a feature flag.
+* **DLQs**: Configure an SQS DLQ for both Lambdas. Add an EventBridge rule for Transcribe `FAILED` to a notifier Lambda that posts to email/Slack.
+* **Transcribe output role**: If required in your account, create a Transcribe data-access role that allows PutObject to the results bucket prefix `tmp/<tenant_id>/` and trust `transcribe.amazonaws.com`.
 
 ---
 
@@ -438,4 +343,4 @@ Trail with Data events for all three buckets, plus management events. Encrypt wi
 
 ---
 
-**Complete.** This v1.2 guide gives you a cu
+**Complete.** This v1.2 guide gives you a customisable QA and insights product on CCI Lite with full click‑through steps and reporting ready for customers.

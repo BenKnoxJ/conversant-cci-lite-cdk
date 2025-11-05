@@ -1,310 +1,126 @@
-# Conversant CCI Lite — End‑to‑End AWS Console Click‑Through Guide (v1.1)
+# Conversant CCI Lite — End‑to‑End AWS Console Click‑Through Guide (v1.2, Customisable QA)
 
-> **Scope**: Single‑account, multi‑tenant, fully serverless pipeline using **S3 → EventBridge → Lambda (Init) → Transcribe (PII redaction) → SNS/EventBridge → Lambda (Result) → Comprehend (batch) → Bedrock → S3(JSON) → Glue → Athena → QuickSight**. No Step Functions. Implements all fixes noted in the v1.1 plan (failover events, decoupled jobs, KMS context, RLS, throttling, cleanup, budgets).
-
-> **Outcome**: A working environment that turns uploaded audio into AI‑enriched JSON and dashboards, with tenant isolation and cost guardrails.
+> **Scope**: Single‑account, multi‑tenant, fully serverless pipeline with **customer‑defined QA forms**. Stack: **S3 → EventBridge → Lambda (Init) → Transcribe (PII redaction) → SNS/EventBridge → Lambda (Result) → Comprehend (batch) → Bedrock → S3(JSON) → Glue → Athena → QuickSight**. No Step Functions.
+>
+> **What’s new in v1.2**: Custom QA templates per tenant in DynamoDB, dynamic Bedrock prompt, structured `qa_evaluation.criteria[]` output for reporting, Athena queries to explode criteria, QuickSight visuals for pass/fail by criterion, agent, and queue.
 
 ---
 
-## 0) Prerequisites and Naming
+## 0) Prerequisites & Naming
 
-Pick concise names and stick to them:
-
-* **Region**: `eu-central-1` (Frankfurt). Bedrock calls will be cross‑region to `us-east-1` if needed.
+* **Region**: `eu-central-1` for core. Bedrock calls in `us-east-1` if required by model.
 * **Tenant example**: `demo-tenant`
-* **Buckets**:
-
-  * `cci-lite-input-<accountid>-eu-central-1`
-  * `cci-lite-results-<accountid>-eu-central-1`
-  * `cci-lite-athena-staging-<accountid>-eu-central-1`
-* **KMS key**: `cci-lite-master-key`
-* **Roles**:
-
-  * Lambda exec: `cci-lite-lambda-role`
-  * Glue crawler: `cci-lite-glue-role`
-  * QuickSight access: `cci-lite-quicksight-role`
-* **Lambdas**:
-
-  * `cci-lite-job-init`
-  * `cci-lite-result-handler`
-* **SNS topic**: `TranscribeJobStatusTopic`
-* **EventBridge rules**:
-
-  * `S3ObjectCreatedToJobInit`
-  * `TranscribeCompletedToResultHandler`
+* **Buckets**: `cci-lite-input-<accountid>-eu-central-1`, `cci-lite-results-<accountid>-eu-central-1`, `cci-lite-athena-staging-<accountid>-eu-central-1`
+* **KMS key**: `alias/cci-lite-master-key`
+* **Roles**: `cci-lite-lambda-role`, `cci-lite-glue-role`, `cci-lite-quicksight-role`
+* **Lambdas**: `cci-lite-job-init`, `cci-lite-result-handler` (optionally `cci-lite-analyzer` for SQS)
+* **SNS Topic**: `TranscribeJobStatusTopic`
+* **EventBridge rules**: `S3ObjectCreatedToJobInit`, `TranscribeCompletedToResultHandler`
 * **DynamoDB table**: `cci-lite-config`
-* **Glue DB**: `cci-lite-db`
-* **Glue Crawler**: `cci-lite-results-crawler`
-* **Athena Workgroups**: `cci-lite-shared`, `tenant-<tenant_id>` (e.g., `tenant-demo-tenant`)
-
-> **Tip**: Replace `<accountid>` and `<tenant_id>` everywhere. Avoid spaces and uppercase characters.
+* **Glue DB**: `cci-lite-db`; **Crawler**: `cci-lite-results-crawler`
+* **Athena workgroups**: `cci-lite-shared`, plus `tenant-<tenant_id>`
 
 ---
 
 ## 1) KMS — Customer Managed Key with Tenant Context
 
-**Console path**: KMS → Keys → Create key → Symmetric → Next.
+KMS → Create key → Symmetric → alias `cci-lite-master-key` → add planned service roles as Key users. After roles exist, optionally enforce tenant guard:
 
-1. **Key type**: Symmetric, Encrypt/Decrypt.
-2. **Alias**: `alias/cci-lite-master-key`.
-3. **Key admins**: Your admin role.
-4. **Key users**: Add Lambda, Glue, Athena, Transcribe, Comprehend, SNS, EventBridge service roles you will create later.
-5. Create the key and note the **Key ARN**.
-
-**Add a key policy condition for tenant context (after roles exist):**
-
-* KMS → `alias/cci-lite-master-key` → Key policy → Edit → add condition allowing decryption only when `kms:EncryptionContext:tenant_id` matches caller’s `aws:PrincipalTag/tenant_id` **for production**. For this guide, we scope by roles and buckets first. You can add context enforcement later once tenant tags are in place.
+```json
+{
+  "Effect": "Allow",
+  "Principal": {"AWS": "arn:aws:iam::<accountid>:role/<tenant_role>"},
+  "Action": ["kms:Decrypt","kms:Encrypt","kms:GenerateDataKey"],
+  "Resource": "*",
+  "Condition": {"StringEquals": {"kms:EncryptionContext:tenant_id": "${aws:PrincipalTag/tenant_id}"}}
+}
+```
 
 ---
 
-## 2) S3 — Buckets, Encryption, Versioning, Lifecycle
+## 2) S3 — Buckets, Encryption, Lifecycle, EventBridge
 
-**Console path**: S3 → Create bucket.
+Create the three buckets with **SSE‑KMS**, versioning on, Block Public Access on. Lifecycle: Input delete after **1 day**, Results after **30 days**. Enable **EventBridge notifications** on the input bucket.
 
-Create three buckets:
-
-1. **Input**: `cci-lite-input-<accountid>-eu-central-1`
-
-   * Block Public Access: **On**.
-   * Default encryption: **AWS KMS** → choose `cci-lite-master-key`.
-   * Versioning: **Enable**.
-   * Lifecycle rule: `delete-input-after-1d` → Filter: prefix `*/calls/` → Expiration: 1 day.
-
-2. **Results**: `cci-lite-results-<accountid>-eu-central-1`
-
-   * Same security settings.
-   * Lifecycle rule: `delete-results-after-30d` → Expiration: 30 days.
-
-3. **Athena staging**: `cci-lite-athena-staging-<accountid>-eu-central-1`
-
-   * Same security settings. No lifecycle needed.
-
-**Folder structure (create as needed):**
+Structure:
 
 ```
 s3://cci-lite-input-.../<tenant_id>/calls/
 s3://cci-lite-results-.../<tenant_id>/YYYY/MM/DD/
 ```
 
-**Enable EventBridge for S3** (failover to Lambda trigger):
+---
 
-* S3 → `cci-lite-input-...` → Properties → Event notifications → **Send events to EventBridge** = **On**.
+## 3) IAM — Roles
+
+Create `cci-lite-lambda-role` (Lambda trust) with permissions for S3 (scoped to three buckets), KMS key, Transcribe, Comprehend batch, Bedrock runtime, SNS, EventBridge, SQS (optional), Logs, X‑Ray.
+
+Create `cci-lite-glue-role` (Glue trust) with read on Results bucket + KMS decrypt; attach `AWSGlueServiceRole`.
+
+Create `cci-lite-quicksight-role` (QuickSight trust) with Athena workgroups access, S3 read on staging/results, Glue read, KMS decrypt.
 
 ---
 
-## 3) IAM — Roles and Policies
+## 4) DynamoDB — Tenant Config + QA Templates
 
-### 3.1 Lambda Execution Role — `cci-lite-lambda-role`
+DynamoDB → Create table: **`cci-lite-config`**, PK=`pk` (String), SK=`sk` (String), on‑demand capacity.
 
-**Console path**: IAM → Roles → Create role → Trusted entity: AWS service → **Lambda** → Next.
+Seed items:
 
-Attach policies (inline JSON where needed):
-
-**S3 access (input/results/athena-staging):**
+**Tenant meta**
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject","s3:PutObject","s3:ListBucket"],
-      "Resource": [
-        "arn:aws:s3:::cci-lite-input-<accountid>-eu-central-1",
-        "arn:aws:s3:::cci-lite-input-<accountid>-eu-central-1/*",
-        "arn:aws:s3:::cci-lite-results-<accountid>-eu-central-1",
-        "arn:aws:s3:::cci-lite-results-<accountid>-eu-central-1/*",
-        "arn:aws:s3:::cci-lite-athena-staging-<accountid>-eu-central-1",
-        "arn:aws:s3:::cci-lite-athena-staging-<accountid>-eu-central-1/*"
-      ]
-    }
-  ]
+  "pk": "TENANT#demo-tenant",
+  "sk": "META#v1",
+  "name": "Demo Tenant",
+  "bedrockModel": "anthropic.claude-3-haiku-20240307"
 }
 ```
 
-**KMS decrypt/encrypt:**
+**Default QA template**
 
 ```json
 {
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["kms:Encrypt","kms:Decrypt","kms:GenerateDataKey"],
-      "Resource": "<KMS_KEY_ARN>"
-    }
-  ]
+  "pk": "TENANT#demo-tenant",
+  "sk": "QA_TEMPLATE#v1",
+  "criteria": [
+    {"id":"greet_01","text":"Did the agent greet the customer politely at the start?","weight":1,"required":true},
+    {"id":"empathy_02","text":"Did the agent acknowledge or empathize with the customer’s issue?","weight":1,"required":true},
+    {"id":"resolve_03","text":"Did the agent provide a clear resolution or next step?","weight":1,"required":true},
+    {"id":"confirm_04","text":"Did the agent confirm customer satisfaction before closing?","weight":0.5,"required":false},
+    {"id":"compliance_05","text":"Was the required compliance statement read?","weight":1,"required":true}
+  ],
+  "scoring": {"pass_threshold": 0.7, "notes": "Weights sum may differ from required items."}
 }
 ```
 
-**Transcribe:**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "transcribe:StartTranscriptionJob",
-      "transcribe:GetTranscriptionJob",
-      "transcribe:ListTranscriptionJobs"
-    ],
-    "Resource": "*"
-  }]
-}
-```
-
-**Comprehend (batch):**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "comprehend:BatchDetectSentiment",
-      "comprehend:BatchDetectEntities",
-      "comprehend:BatchDetectKeyPhrases"
-    ],
-    "Resource": "*"
-  }]
-}
-```
-
-**Bedrock runtime (cross‑region):**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream"
-    ],
-    "Resource": "*"
-  }]
-}
-```
-
-**SNS + EventBridge + SQS (used by handlers):**
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect":"Allow","Action":["sns:Publish","sns:Subscribe","sns:CreateTopic","sns:GetTopicAttributes"],"Resource":"*"},
-    {"Effect":"Allow","Action":["events:PutEvents","events:DescribeRule","events:PutRule","events:PutTargets"],"Resource":"*"},
-    {"Effect":"Allow","Action":["sqs:SendMessage","sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes"],"Resource":"*"}
-  ]
-}
-```
-
-**CloudWatch Logs/X‑Ray:** Attach AWS managed `AWSLambdaBasicExecutionRole` and `AWSXRayDaemonWriteAccess`.
-
-> You can merge the above into a single inline policy or split per service. Keep the scope to the named resources where possible.
-
-### 3.2 Glue Crawler Role — `cci-lite-glue-role`
-
-**Console path**: IAM → Roles → Create role → **Glue** → Next.
-
-* Attach `AWSGlueServiceRole`.
-* Inline policy for S3 results + KMS:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect":"Allow","Action":["s3:ListBucket","s3:GetObject"],"Resource":[
-      "arn:aws:s3:::cci-lite-results-<accountid>-eu-central-1",
-      "arn:aws:s3:::cci-lite-results-<accountid>-eu-central-1/*"
-    ]},
-    {"Effect":"Allow","Action":["kms:Decrypt"],"Resource":"<KMS_KEY_ARN>"}
-  ]
-}
-```
-
-### 3.3 QuickSight Role — `cci-lite-quicksight-role`
-
-If using Enterprise edition with identity‑based access to Athena:
-
-* Trust: `quicksight.amazonaws.com`
-* Permissions: `athena:*` on workgroups, `s3:GetObject` on results and staging, `glue:Get*` on Data Catalog, KMS decrypt on key.
+You can create multiple templates (e.g., `QA_TEMPLATE#sales`, `QA_TEMPLATE#support`).
 
 ---
 
-## 4) DynamoDB — Config Table for Tenants
+## 5) SNS — Transcribe Status Topic
 
-**Console path**: DynamoDB → Tables → Create table.
-
-* Table name: `cci-lite-config`
-* Partition key: `pk` (String)
-* Sort key: `sk` (String)
-* On‑demand capacity.
-
-**Seed minimal items** (use Console → Explore table items → Create item):
-
-* Tenant metadata:
-
-  * `pk = TENANT#demo-tenant`, `sk = META#v1`, other attributes: `{ "name": "Demo Tenant", "bedrockModel": "anthropic.claude-3-haiku-20240307" }`
-* Model config:
-
-  * `pk = CONFIG#MODELS`, `sk = bedrock`, `{ "default": "anthropic.claude-3-haiku-20240307" }`
-
----
-
-## 5) SNS — Topic for Transcribe Job Status
-
-**Console path**: SNS → Topics → Create topic.
-
-* Type: Standard
-* Name: `TranscribeJobStatusTopic`
-* Encryption: KMS key `cci-lite-master-key`.
-
-Copy the **Topic ARN**.
+SNS → Create topic `TranscribeJobStatusTopic` (encrypted with KMS). Copy the Topic ARN.
 
 ---
 
 ## 6) EventBridge — Rules
 
-### 6.1 S3 Object Created → Lambda #1 (Job Init)
-
-**Console path**: EventBridge → Rules → Create rule.
-
-* Name: `S3ObjectCreatedToJobInit`
-* Event bus: default
-* Rule type: **Rule with an event pattern**
-* Pattern: **AWS events or EventBridge partner events** → **S3** → **Object Created** → bucket equals `cci-lite-input-…`
-* Add **condition** on key prefix: you cannot filter by prefix directly in pattern; add a **target input transformer** or filter in Lambda. Keep Lambda filter simple by checking key startswith `<tenant_id>/calls/`.
-* Target: Lambda function `cci-lite-job-init`
-
-### 6.2 Transcribe Completed → Lambda #2 (Result Handler)
-
-* Name: `TranscribeCompletedToResultHandler`
-* Pattern source: **Transcribe** → **Transcription Job State Change** → `TranscriptionJobStatus = COMPLETED`
-* Target: Lambda `cci-lite-result-handler`
-
-> Optional: Add a second rule for `FAILED` to a dead‑letter queue or notification Lambda.
+* **S3ObjectCreatedToJobInit**: Source **S3**, event type **Object Created**, bucket = input bucket. Target = `cci-lite-job-init`. Filter key prefix `/calls/` in Lambda code.
+* **TranscribeCompletedToResultHandler**: Source **Transcribe**, detail filter `TranscriptionJobStatus = COMPLETED`. Target = `cci-lite-result-handler`. Add a second rule for `FAILED` to a notification Lambda or DLQ if desired.
 
 ---
 
-## 7) SQS — Throttling Queues (Optional but Recommended)
+## 7) SQS (Optional) — Analysis Buffer
 
-Create one queue `cci-lite-analysis-queue` to buffer Comprehend/Bedrock work when many jobs finish at once.
-
-* SQS → Create queue → Standard → Name `cci-lite-analysis-queue`.
-* Encryption: KMS key.
-* Configure Lambda #2 to push work to SQS, and a third Lambda `cci-lite-analyzer` to process messages at a controlled concurrency (e.g., reserved concurrency = 10). If you prefer simplicity, keep analysis inside Lambda #2 and rely on its reserved concurrency.
+Create `cci-lite-analysis-queue` with KMS encryption. Used if you expect high concurrency spikes; otherwise, keep analysis in `result-handler`.
 
 ---
 
 ## 8) Lambda Functions
 
-### 8.1 Shared Settings
-
-* **Runtime**: Python 3.12
-* **Role**: `cci-lite-lambda-role`
-* **Env vars** (both functions, adjust per function):
+### 8.1 Shared Environment Variables
 
 ```
 INPUT_BUCKET=cci-lite-input-<accountid>-eu-central-1
@@ -315,161 +131,99 @@ SNS_TOPIC_ARN=<SNS_TOPIC_ARN>
 BEDROCK_MODEL_ID=anthropic.claude-3-haiku-20240307
 BEDROCK_REGION=us-east-1
 DDB_TABLE=cci-lite-config
+QA_TEMPLATE_KEY=QA_TEMPLATE#v1
 LOG_LEVEL=INFO
 ```
 
-* **Monitoring**: Enable X‑Ray tracing. Set log retention 30d.
-
-> Reserved concurrency: set 50 across functions to cap spend. For analyzer, set 10.
+Enable X‑Ray; set log retention 30 days. Reserve concurrency caps: **50** total; analyzer **10** if used.
 
 ### 8.2 `cci-lite-job-init` — Start Transcribe with PII Redaction
 
-**Console path**: Lambda → Create function → Author from scratch.
+* Trigger: EventBridge S3 rule (failover to direct S3 trigger if you also add one)
+* Timeout 2 min, Memory 1024 MB
 
-* Name: `cci-lite-job-init`
-* Timeout: 2 minutes
-* Memory: 1024 MB
+**Key behaviour**: Validate `/calls/` prefix → derive `tenant_id` → start job with output to `results/tmp/<tenant_id>/` + SNS notifications. (Use the v1.1 code; unchanged for v1.2.)
 
-**Code (minimal reference outline, paste into console editor and adjust):**
+### 8.3 `cci-lite-result-handler` — Transcript → NLP → Custom QA → Unified JSON
 
-```python
-import os, json, urllib.parse
-import boto3
+* Trigger: EventBridge (Transcribe COMPLETED)
+* Timeout 5–10 min, Memory 1536 MB
 
-s3 = boto3.client('s3')
-transcribe = boto3.client('transcribe')
-sns_arn = os.environ['SNS_TOPIC_ARN']
+**New logic in v1.2**: fetch tenant QA template from DynamoDB and pass to Bedrock; capture structured `qa_evaluation`.
 
-def lambda_handler(event, context):
-    # Handle both EventBridge S3 event and direct S3 trigger (defensive)
-    records = event.get('Records') or []
-    if not records and 'detail' in event:
-        # EventBridge S3 event
-        detail = event['detail']
-        bucket = detail['bucket']['name']
-        key = detail['object']['key']
-    else:
-        r = records[0]
-        bucket = r['s3']['bucket']['name']
-        key = urllib.parse.unquote_plus(r['s3']['object']['key'])
-
-    # Only process /calls/
-    if '/calls/' not in key:
-        return {"skipped": True, "key": key}
-
-    tenant_id = key.split('/')[0]
-    job_name = f"cci_{tenant_id}_{key.split('/')[-1].replace('.', '_')}"
-    media_uri = f"s3://{bucket}/{key}"
-
-    transcribe.start_transcription_job(
-        TranscriptionJobName=job_name,
-        Media={"MediaFileUri": media_uri},
-        LanguageCode="en-GB",
-        OutputBucketName=os.environ['OUTPUT_BUCKET'],
-        OutputKey=f"tmp/{tenant_id}/",
-        Settings={
-            "ShowSpeakerLabels": False,
-            "ChannelIdentification": False
-        },
-        ContentRedaction={
-            "RedactionType": "PII",
-            "RedactionOutput": "redacted"
-        },
-        JobExecutionSettings={
-            "AllowDeferredExecution": True,
-            "DataAccessRoleArn": os.environ.get('TRANSCRIBE_ROLE_ARN', '')
-        },
-        Subtitles={"Formats": ["vtt"]},
-        Tags=[{"Key":"tenant_id","Value":tenant_id}],
-        OutputEncryptionKMSKeyId=os.environ['KMS_KEY_ARN'],
-        Notifications={
-            "Completed": sns_arn,
-            "Failed": sns_arn
-        }
-    )
-
-    return {"started": True, "job": job_name, "tenant": tenant_id}
-```
-
-> If your account/region requires a Transcribe data access role, create it and set `TRANSCRIBE_ROLE_ARN` env var.
-
-### 8.3 `cci-lite-result-handler` — Fetch Transcript, Analyze, Write Unified JSON
-
-* Name: `cci-lite-result-handler`
-* Trigger: EventBridge rule `TranscribeCompletedToResultHandler` (add target now)
-* Timeout: 5 minutes
-* Memory: 1536 MB
-
-**Add EventBridge trigger**: Lambda → Triggers → Add trigger → EventBridge → choose rule.
-
-**Code (outline):**
+**Code outline (replaces the summariser and adds QA):**
 
 ```python
-import os, json, boto3, datetime, urllib.parse
+import os, json, boto3, datetime
 
 s3 = boto3.client('s3')
-transcribe = boto3.client('transcribe')
 comprehend = boto3.client('comprehend')
 bedrock = boto3.client('bedrock-runtime', region_name=os.environ['BEDROCK_REGION'])
+ddb = boto3.resource('dynamodb').Table(os.environ['DDB_TABLE'])
 
 OUTPUT_BUCKET = os.environ['OUTPUT_BUCKET']
 MODEL_ID = os.environ['BEDROCK_MODEL_ID']
+QA_TEMPLATE_KEY = os.environ['QA_TEMPLATE_KEY']
 
 
-def _load_transcript_from_s3(output_bucket, job_name, tenant_id):
-    # Transcribe puts JSON under the OutputKey prefix; list and fetch the JSON
+def _load_transcript_from_s3(output_bucket, tenant_id):
     prefix = f"tmp/{tenant_id}/"
     resp = s3.list_objects_v2(Bucket=output_bucket, Prefix=prefix)
     for o in resp.get('Contents', []):
         if o['Key'].endswith('.json'):
-            body = s3.get_object(Bucket=output_bucket, Key=o['Key'])['Body'].read()
-            return json.loads(body)
+            return json.loads(s3.get_object(Bucket=output_bucket, Key=o['Key'])['Body'].read())
     raise RuntimeError('Transcript JSON not found')
 
 
-def _bedrock_summarize(text):
+def _get_qa_template(tenant_id):
+    resp = ddb.get_item(Key={"pk": f"TENANT#{tenant_id}", "sk": QA_TEMPLATE_KEY})
+    return resp.get('Item', {"criteria": []})
+
+
+def _bedrock_eval(text, qa_template):
+    # Trim to protect token budget
+    t = text[:45000]
     prompt = (
-        "You are analyzing a customer service call. Return JSON with fields: "
-        "issue, resolution, outcome, action_items[], qa_score(0-100), tone_score(0-100), sentiment_summary.\n"
-        f"Transcript:\n{text[:15000]}"
+        "You are a strict call QA evaluator. Given the transcript and the QA criteria, return pure JSON.\n"
+        "Required keys: issue, resolution, outcome, action_items[], tone_score(0-100), sentiment_summary,\n"
+        "qa_evaluation: {criteria:[{id,question,passed,score,reason}], total_score, max_score, percentage, failed:[{id,reason}]}\n"
+        "Scoring: score is 0 or the provided weight (if given). If required=true and not met, passed=false.\n"
+        f"QA_CRITERIA_JSON: {json.dumps(qa_template.get('criteria', []))}\n"
+        f"TRANSCRIPT:\n{t}"
     )
-    body = {"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":[{"type":"text","text":prompt}]}],"max_tokens":1500}
+    body = {"anthropic_version":"bedrock-2023-05-31","messages":[{"role":"user","content":[{"type":"text","text":prompt}]}],"max_tokens":1800}
     resp = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
     payload = json.loads(resp['body'].read())
-    # Extract text content depending on provider structure
     content = payload.get('output_text') or payload.get('content', [{}])[0].get('text') or json.dumps(payload)
-    # Expect JSON in content; be defensive
     try:
         return json.loads(content)
-    except:
+    except Exception:
         return {"summary_raw": content}
 
 
-def lambda_handler(event, context):
+def handler(event, context):
     detail = event.get('detail', {})
-    job_name = detail.get('TranscriptionJobName') or detail.get('TranscriptionJob')['TranscriptionJobName']
+    job_name = detail.get('TranscriptionJobName') or detail.get('TranscriptionJob',{}).get('TranscriptionJobName')
+    tenant_id = job_name.split('_')[1] if job_name and '_' in job_name else 'unknown'
 
-    # Derive tenant from job name convention if not provided
-    parts = job_name.split('_')
-    tenant_id = parts[1] if len(parts) > 2 else 'unknown'
+    # Load transcript assembled by Transcribe
+    transcript = _load_transcript_from_s3(OUTPUT_BUCKET, tenant_id)
+    texts = transcript.get('results', {}).get('transcripts', [])
+    call_text = "\n".join([x.get('transcript','') for x in texts])
 
-    # Get transcript JSON from S3 output
-    transcript = _load_transcript_from_s3(OUTPUT_BUCKET, job_name, tenant_id)
-
-    # Compose a single text string for NLP
-    items = transcript.get('results', {}).get('transcripts', [])
-    call_text = '\n'.join([t.get('transcript','') for t in items])[:45000]
-
-    # Comprehend batch APIs expect list of up to 25 docs; use 1 doc
+    # Comprehend NLP
     comp_in = [call_text]
     sentiment = comprehend.batch_detect_sentiment(TextList=comp_in, LanguageCode='en')
     phrases = comprehend.batch_detect_key_phrases(TextList=comp_in, LanguageCode='en')
     entities = comprehend.batch_detect_entities(TextList=comp_in, LanguageCode='en')
 
-    # Bedrock summary
-    ai = _bedrock_summarize(call_text)
+    # QA template per tenant
+    qa_template = _get_qa_template(tenant_id)
 
-    # Unified JSON (cci-lite-v1.1)
+    # Bedrock evaluation with custom QA
+    ai = _bedrock_eval(call_text, qa_template)
+
+    # Unified JSON v1.2
     now = datetime.datetime.utcnow()
     out = {
         "tenant_id": tenant_id,
@@ -478,220 +232,210 @@ def lambda_handler(event, context):
         "sentiment": sentiment.get('ResultList',[{}])[0],
         "key_phrases": phrases.get('ResultList',[{}])[0],
         "entities": entities.get('ResultList',[{}])[0],
-        "ai_summary": ai,
-        "source": {
-            "transcribe_job": job_name,
-            "pii_redacted": True
-        }
+        "ai_summary": {
+            "issue": ai.get('issue'),
+            "resolution": ai.get('resolution'),
+            "outcome": ai.get('outcome'),
+            "action_items": ai.get('action_items'),
+            "tone_score": ai.get('tone_score'),
+            "sentiment_summary": ai.get('sentiment_summary')
+        },
+        "qa_evaluation": ai.get('qa_evaluation', {}),
+        "source": {"transcribe_job": job_name, "pii_redacted": True}
     }
 
     key = f"{tenant_id}/{now.year:04d}/{now.month:02d}/{now.day:02d}/{job_name}.json"
-    s3.put_object(Bucket=OUTPUT_BUCKET, Key=key, Body=json.dumps(out).encode('utf-8'), ServerSideEncryption='aws:kms', SSEKMSKeyId=os.environ['KMS_KEY_ARN'])
+    s3.put_object(Bucket=OUTPUT_BUCKET, Key=key, Body=json.dumps(out).encode('utf-8'),
+                  ServerSideEncryption='aws:kms', SSEKMSKeyId=os.environ['KMS_KEY_ARN'],
+                  Tagging=f"tenant_id={tenant_id}")
 
     return {"written": f"s3://{OUTPUT_BUCKET}/{key}"}
 ```
 
-> For heavy loads, push a message to SQS with `{ bucket, key }` and move Comprehend/Bedrock to `cci-lite-analyzer`.
+> For high volume, send a compact payload to SQS and move NLP/Bedrock to an `analyzer` Lambda.
 
 ---
 
 ## 9) CloudWatch — Logs, Metrics, Alarms
 
-**Console path**: CloudWatch → Logs → Log groups.
-
-* Confirm both Lambdas produce logs.
-
-**Alarms**: CloudWatch → Alarms → Create alarm
-
-* Metric: Lambda Errors ≥ 1 (per function) → action: email/Slack.
-* Metric: `bedrock` latency (custom log metric filter if desired) > 10s.
-* Metric: Transcribe failures (use EventBridge rule for FAILED → SNS/email).
-
-Retention: 30 days per log group.
+* Errors ≥ 1 per function → notify.
+* Transcribe `FAILED` path → dedicated rule to notify or DLQ.
+* Optional custom metric filter for Bedrock latency > 10s.
+* Retention 30 days.
 
 ---
 
-## 10) Glue — Database and Crawler
+## 10) Glue — Database & Crawler
 
-**Console path**: Glue → Data Catalog → Databases → Add database → `cci-lite-db`.
-
-**Crawler**: Glue → Crawlers → Create crawler
-
-* Name: `cci-lite-results-crawler`
-* Data source: S3 → `cci-lite-results-...`
-* IAM role: `cci-lite-glue-role`
-* Schedule: Daily
-* Output: Database `cci-lite-db` → Create table
-* Classifiers: JSON (default). Ensure it infers `tenant_id` and partitions by path (`tenant_id` + `YYYY/MM/DD`). If not, keep table unpartitioned initially; you can promote to partitioned via ETL later.
-
-Run the crawler once and verify a table appears (e.g., `results`).
+* Database: `cci-lite-db`.
+* Crawler: name `cci-lite-results-crawler`, source = Results bucket, role `cci-lite-glue-role`, schedule Daily, output to `cci-lite-db`.
+* Run once to create `results` table from JSON. (For large scale, later convert to Parquet with a Glue job.)
 
 ---
 
-## 11) Athena — Workgroups, Query, and Staging
+## 11) Athena — Workgroups & Queries
 
-**Console path**: Athena → Workgroups → Create workgroup
+Workgroups: `cci-lite-shared`, `tenant-<id>` with enforced result locations in the staging bucket.
 
-* `cci-lite-shared` → Query result location: `s3://cci-lite-athena-staging-.../shared/`
-* For each tenant: `tenant-demo-tenant` → Result location `s3://cci-lite-athena-staging-.../tenant-demo-tenant/`
-
-**Settings**: Enable **enforce workgroup settings**, set bytes scanned limit if desired.
-
-**Query** (Athena → Query editor → Workgroup `cci-lite-shared`, Database `cci-lite-db`):
+**Explode QA criteria (typical reporting view):**
 
 ```sql
-SELECT tenant_id, call_date,
-       sentiment.ResultList[1].Sentiment AS overall,
-       ai_summary.qa_score AS qa_score,
-       ai_summary.tone_score AS tone_score
-FROM "cci-lite-db"."results"
-WHERE call_date >= date_format(current_date - interval '7' day, '%Y-%m-%d');
+-- Replace table/column paths to match your crawler output
+WITH base AS (
+  SELECT
+    tenant_id,
+    call_id,
+    call_date,
+    json_extract(ai_summary, '$.tone_score')        AS tone_score,
+    json_extract(ai_summary, '$.sentiment_summary') AS sentiment_summary,
+    json_extract(qa_evaluation, '$.criteria')       AS criteria
+  FROM "cci-lite-db"."results"
+  WHERE tenant_id = 'demo-tenant'
+)
+SELECT
+  tenant_id,
+  call_id,
+  call_date,
+  json_extract_scalar(citem, '$.id')        AS criterion_id,
+  json_extract_scalar(citem, '$.question')  AS question,
+  CAST(json_extract_scalar(citem, '$.passed') AS boolean) AS passed,
+  CAST(json_extract_scalar(citem, '$.score') AS double)   AS score
+FROM base
+CROSS JOIN UNNEST(cast(json_parse(criteria) as array(json))) AS t(citem);
 ```
 
-Adjust JSON accessors to match crawler output; use `json_extract_scalar` if stored as strings.
+**Failure rate per criterion:**
 
----
-
-## 12) QuickSight — Dataset, RLS, Dashboard
-
-**Console path**: QuickSight → Datasets → New dataset → Athena → choose workgroup `cci-lite-shared` → select `cci-lite-db` table.
-
-* Import to SPICE.
-* Create a **RLS dataset** with columns (`user_email`, `tenant_id`). Attach RLS to the main dataset.
-* Build visuals: sentiment over time, QA score by agent (if supplied later), tone distribution, top key phrases.
-* Schedule SPICE refresh **daily**.
-
----
-
-## 13) Budgets — Cost Guardrails
-
-**Console path**: AWS Budgets → Create budget → **Cost budget**.
-
-* Scope: Services Transcribe, Bedrock, Lambda.
-* Thresholds: e.g., £50 and £100 with email alerts.
-
-**Lambda reserved concurrency**: Lambda → Functions → each → Concurrency → Reserve → 50 (or lower for analyzer = 10).
-
----
-
-## 14) CloudTrail — Data Events and Audit
-
-**Console path**: CloudTrail → Trails → Create trail.
-
-* Log **Data events** for S3 (read/write) on the three buckets.
-* Management events: Read/Write.
-* Encryption: KMS key.
-
----
-
-## 15) Security Hardening (After Smoke Tests)
-
-* Add **KMS encryption context** requirements once you tag principals by tenant:
-
-  * Tag tenant‑scoped roles/users with `tenant_id`.
-  * Update KMS key policy conditions to require `kms:EncryptionContext:tenant_id == ${aws:PrincipalTag/tenant_id}`.
-* S3 bucket policies to only allow access if `s3:ExistingObjectTag/tenant_id` matches caller tag.
-* Add object tag `tenant_id` when writing results.
-
----
-
-## 16) Validation — End‑to‑End Tests
-
-1. Upload a `.wav` file to `s3://cci-lite-input-.../demo-tenant/calls/<anyname>.wav`.
-2. EventBridge rule fires → `cci-lite-job-init` starts Transcribe.
-3. Transcribe completes → SNS → EventBridge → `cci-lite-result-handler` starts.
-4. Check CloudWatch logs for both Lambdas: no errors.
-5. Confirm JSON written under `s3://cci-lite-results-.../demo-tenant/YYYY/MM/DD/<jobname>.json`.
-6. Run Glue crawler; confirm or update schema.
-7. Run Athena query; verify rows.
-8. Open QuickSight dashboard; confirm visuals update.
-9. Confirm budgets and alarms status.
-
-**Success criterion**: Cost per 10‑min call ≤ £0.25, JSON matches `cci-lite-v1.1` fields, dashboard renders.
-
----
-
-## 17) Troubleshooting Checklist
-
-* **No Lambda #1 trigger**: Check EventBridge rule is enabled, S3 bucket has EventBridge delivery enabled, and object path includes `/calls/`.
-* **Transcribe access denied**: Ensure Transcribe can read S3 input and write to results `tmp/` prefix; add Transcribe service role if required.
-* **No completion event**: Verify SNS topic ARN wired in Transcribe job, and EventBridge rule filters `COMPLETED`.
-* **Results missing**: Inspect `cci-lite-result-handler` logs; verify it finds the transcript JSON under `tmp/<tenant_id>/`.
-* **Comprehend throttling**: Reduce concurrency or insert SQS buffer; ensure batch API used.
-* **Bedrock errors**: Confirm model access in `us-east-1`, add retry with exponential backoff; reduce prompt size.
-* **Glue schema wrong**: Use a Glue ETL job to flatten JSON or convert to Parquet; rerun crawler.
-* **Athena permission denied**: Ensure workgroup result location and bucket/kms permissions are correct.
-* **QuickSight empty**: Refresh SPICE, check RLS mapping.
-
----
-
-## 18) Optional Enhancements (Safe to Add Later)
-
-* Third Lambda `cci-lite-analyzer` off an SQS queue for high‑volume scaling.
-* Daily Glue ETL to Parquet and partitioned tables for faster Athena.
-* DLQ for both Lambdas via SQS to capture failed events.
-* EventBridge rule for `FAILED` Transcribe jobs → notify via SNS/Email.
-
----
-
-## 19) Rollback & Cleanup
-
-If you need to reset the environment:
-
-* Disable EventBridge rules.
-* Delete Lambda triggers and functions.
-* Delete SNS topic.
-* Delete Glue crawler and DB.
-* Empty and delete S3 buckets.
-* Delete DynamoDB table.
-* Delete CloudWatch log groups and alarms.
-* Delete Budgets (optional).
-* Delete CloudTrail trail (optional).
-* Finally, schedule KMS key deletion (after verifying nothing depends on it).
-
----
-
-## 20) Operator Runbook (Daily)
-
-* Check CloudWatch alarms state.
-* Confirm budgets under threshold.
-* Review Glue crawler last run success.
-* Spot‑check last 24h Athena queries.
-* Validate QuickSight SPICE refresh.
-
----
-
-### Appendix A — Minimal RLS Mapping CSV (QuickSight)
-
-```
-user_email,tenant_id
-alice@example.com,demo-tenant
-bob@partner.co,partner-tenant
+```sql
+SELECT criterion_id,
+       question,
+       1 - avg(CASE WHEN passed THEN 1.0 ELSE 0.0 END) AS fail_rate,
+       count(*) AS calls
+FROM (<previous query>)
+GROUP BY 1,2
+ORDER BY fail_rate DESC, calls DESC;
 ```
 
-### Appendix B — Example Unified JSON (cci-lite-v1.1)
+---
+
+## 12) QuickSight — Datasets, RLS, Dashboards
+
+1. Create Athena dataset from `cci-lite-db.results`.
+2. Create a second dataset using the **Explode QA criteria** query as a custom SQL dataset.
+3. RLS: mapping of `user_email` → `tenant_id` dataset; attach to both datasets.
+4. Visuals:
+
+   * KPI: Overall QA% = avg(passed) by time (use custom SQL dataset)
+   * Table: Top failed criteria with fail_rate and call count
+   * Heatmap: Agent × Criterion fail rate (once agent id is available in metadata)
+   * Trend: Tone score and sentiment over time
+5. SPICE refresh: Daily.
+
+---
+
+## 13) Budgets & Concurrency Guards
+
+* Budgets for Transcribe, Bedrock, Lambda.
+* Reserve concurrency caps. Optionally per‑function caps to prioritise the result‑handler.
+
+---
+
+## 14) CloudTrail — Data Events
+
+Trail with Data events for all three buckets, plus management events. Encrypt with KMS.
+
+---
+
+## 15) Security Hardening
+
+* S3 bucket policies that require `s3:ExistingObjectTag/tenant_id` to match caller’s principal tag.
+* Write object tag `tenant_id` on all results (already done in code).
+* Enforce KMS encryption context after you tag tenant principals.
+* QuickSight: use row‑level security and separate workgroups if stronger isolation is needed.
+
+---
+
+## 16) End‑to‑End Validation
+
+1. Upload `.wav` to `s3://cci-lite-input-.../demo-tenant/calls/test.wav`.
+2. EventBridge → `job-init` starts Transcribe; SNS wired.
+3. On COMPLETED, `result-handler` runs.
+4. Check S3 results path for JSON; confirm fields `qa_evaluation.criteria[]` exist.
+5. Run Glue crawler; confirm/update schema.
+6. Athena queries return rows; exploded criteria query works.
+7. QuickSight dashboards show QA pass/fail, failure leaders.
+8. Confirm alarms and budgets are quiet.
+
+**Success**: Per‑criterion reporting available. Cost per 10‑min call ≤ target. PII redacted. Multi‑tenant isolation intact.
+
+---
+
+## 17) Troubleshooting Focus for v1.2
+
+* **No QA in JSON**: Check DynamoDB item path (`TENANT#<id>` + `QA_TEMPLATE#v1`), env var `QA_TEMPLATE_KEY`, and Bedrock output parsing.
+* **Model output not JSON**: Add stricter instruction and a one‑line repair step (e.g., wrap with `{"qa_evaluation": ...}`); log the raw text to debug.
+* **Crawler mis‑types arrays**: Use custom classifier or create a curated external table via Athena DDL for the exploded view.
+* **High Bedrock latency**: Reduce transcript slice, use summarised chunks, or switch to a cheaper/faster model.
+* **Comprehend throttling**: Insert SQS buffer or reduce reserved concurrency.
+
+---
+
+## 18) Optional Enhancements
+
+* **Versioned QA**: Store multiple templates (`QA_TEMPLATE#v2`) and include version used in the output (`qa_template_version`).
+* **Agent/Queue metadata**: Join with external CRM/CCaaS webhook data and add to the JSON for richer reporting.
+* **ETL to Parquet**: Nightly Glue job to flatten and write Parquet tables for faster Athena and cheaper queries.
+* **DLQs**: SQS DLQ for both Lambdas; EventBridge rule for Transcribe `FAILED` → notify.
+
+---
+
+## 19) Example Unified JSON (v1.2)
 
 ```json
 {
   "tenant_id": "demo-tenant",
-  "call_id": "cci_demo-tenant_sample_wav",
+  "call_id": "cci_demo-tenant_test_wav",
   "call_date": "2025-11-05",
-  "sentiment": {"ResultList": [{"Sentiment": "NEUTRAL", "SentimentScore": {"Positive":0.1,"Negative":0.2,"Neutral":0.7,"Mixed":0.0}}]},
+  "sentiment": {"ResultList": [{"Sentiment": "NEUTRAL"}]},
   "key_phrases": {"ResultList": [{"KeyPhrases": [{"Text": "order number"}]}]},
-  "entities": {"ResultList": [{"Entities": [{"Text": "Alice","Type":"PERSON"}]}]},
+  "entities": {"ResultList": [{"Entities": [{"Text": "Alice", "Type": "PERSON"}]}]},
   "ai_summary": {
     "issue": "Billing query",
     "resolution": "Explained invoice line items",
     "outcome": "Resolved",
     "action_items": ["Email revised invoice"],
-    "qa_score": 82,
     "tone_score": 73,
-    "sentiment_summary": "Mostly neutral with brief negative"
+    "sentiment_summary": "Mostly neutral"
   },
-  "source": {"transcribe_job": "cci_demo-tenant_sample_wav", "pii_redacted": true}
+  "qa_evaluation": {
+    "criteria": [
+      {"id": "greet_01", "question": "Did the agent greet the customer politely at the start?", "passed": true,  "score": 1,   "reason": "Greeting present"},
+      {"id": "empathy_02","question": "Did the agent acknowledge or empathize with the customer’s issue?", "passed": false, "score": 0,   "reason": "No empathy statement"},
+      {"id": "resolve_03","question": "Did the agent provide a clear resolution or next step?",            "passed": true,  "score": 1,   "reason": "Clear resolution"},
+      {"id": "confirm_04","question": "Did the agent confirm customer satisfaction before closing?",       "passed": true,  "score": 0.5, "reason": "Asked for confirmation"},
+      {"id": "compliance_05","question": "Was the required compliance statement read?",                   "passed": false, "score": 0,   "reason": "No compliance script"}
+    ],
+    "total_score": 2.5,
+    "max_score": 3.5,
+    "percentage": 71,
+    "failed": [
+      {"id": "empathy_02", "reason": "No empathy statement"},
+      {"id": "compliance_05", "reason": "No compliance script"}
+    ]
+  },
+  "source": {"transcribe_job": "cci_demo-tenant_test_wav", "pii_redacted": true}
 }
 ```
 
 ---
 
-**Done.** Follow the sections in order. We can now run the flow step by step and validate each stage before moving on.
+## 20) Operator Runbook (Daily)
+
+* Check CloudWatch alarms.
+* Review Budgets.
+* Verify Glue crawler success and QuickSight SPICE refresh.
+* Run the **Explode QA** query; export weekly failure leaderboard.
+
+---
+
+**Complete.** This v1.2 guide gives you a cu

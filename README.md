@@ -239,46 +239,114 @@ Create `cci-lite-analysis-queue` with KMS encryption. Used if you expect high co
 
 ---
 
-## 7) Lambda Functions
+# 7  Lambda Functions
 
-### 7.1 Shared Environment Variables
+### Overview
 
-```
-INPUT_BUCKET=cci-lite-input-<accountid>-eu-central-1
-OUTPUT_BUCKET=cci-lite-results-<accountid>-eu-central-1
-ATHENA_STAGING_BUCKET=cci-lite-athena-staging-<accountid>-eu-central-1
-KMS_KEY_ARN=<KMS_KEY_ARN>
-SNS_TOPIC_ARN=<SNS_TOPIC_ARN>
-BEDROCK_MODEL_ID=anthropic.claude-3-haiku-20240307
+This phase defines the Lambda components that orchestrate transcription, enrichment, and analytics in the CCI Lite pipeline.
+EventBridge has been removed; all events now flow through **S3 → SNS → SQS → Lambda**.
+
+---
+
+## 7.1 Shared Environment Variables
+
+These apply to both Lambdas. All values are production-ready for the `eu-central-1` region.
+
+```bash
+INPUT_BUCKET=cci-lite-input-591338347562-eu-central-1
+OUTPUT_BUCKET=cci-lite-results-591338347562-eu-central-1
+ATHENA_STAGING_BUCKET=cci-lite-athena-staging-591338347562-eu-central-1
+KMS_KEY_ARN=arn:aws:kms:eu-central-1:591338347562:key/79d23f7f-9420-4398-a848-93876d0250e5
+SNS_TOPIC_ARN=arn:aws:sns:eu-central-1:591338347562:TranscribeJobStatusTopic
+SQS_QUEUE_URL=https://sqs.eu-central-1.amazonaws.com/591338347562/cci-lite-analysis-queue
+BEDROCK_MODEL=anthropic.claude-3-haiku-20240307
 BEDROCK_REGION=us-east-1
 DDB_TABLE=cci-lite-config
 QA_TEMPLATE_KEY=QA_TEMPLATE#v1
 LOG_LEVEL=INFO
 ```
 
-Enable X‑Ray; set log retention 30 days. Reserve concurrency caps: **50** total; analyzer **10** if used.
+**Additional settings**
 
-### 7.2 `cci-lite-job-init` — Start Transcribe with PII Redaction
+* Enable **X-Ray** tracing.
+* CloudWatch log retention: 30 days.
+* Reserve concurrency: total 50 (10 for analyzer if added).
 
-* Trigger: EventBridge S3 rule (failover to direct S3 trigger if you also add one)
-* Timeout 2 min, Memory 1024 MB
+---
 
-**Key behaviour**: Validate `/calls/` prefix → derive `tenant_id` → start job with output to `results/tmp/<tenant_id>/` + SNS notifications.
+## 7.2 cci-lite-job-init — Start Transcribe with PII Redaction
 
-### 7.3 `cci-lite-result-handler` — Transcript → NLP → Custom QA → Unified JSON
+| Property    | Value                                                 |
+| ----------- | ----------------------------------------------------- |
+| **Trigger** | S3 (Object Created) on input bucket, prefix `/calls/` |
+| **Timeout** | 2 minutes                                             |
+| **Memory**  | 1024 MB                                               |
 
-* Trigger: EventBridge (Transcribe COMPLETED)
-* Timeout 10 min, Memory 1536 MB
+**Logic**
 
-**Logic**: Fetch tenant QA template from DynamoDB, evaluate via Bedrock, and write unified JSON. Include retry/backoff for transcript availability and a basic JSON repair step if the model output is malformed. Keep deterministic S3 keys based on `job_name` for idempotency.
+1. Triggered when a new call audio file is uploaded.
+2. Validates prefix (`/calls/`) and extracts `tenant_id`.
+3. Starts an Amazon Transcribe Call Analytics job with **PII redaction enabled**.
+4. Output is written to `results/tmp/<tenant_id>/`.
+5. Publishes completion events to `TranscribeJobStatusTopic` (SNS).
 
-### 7.4 Production Hardening (merge these into your handler)
+**Notes**
 
-* **Transcript availability backoff**: After `COMPLETED`, loop-list the `results/tmp/<tenant_id>/` prefix up to ~45 s with a small delay until the JSON appears. Fail with a clear error if not found.
-* **JSON repair**: If Bedrock returns non-JSON, strip code fences, trim trailing commas, ensure balanced braces, then retry JSON parse. If still failing, write a `summary_raw` field and mark the call for review.
-* **Idempotency**: Use deterministic `call_id` from `TranscriptionJobName` and check if the target results key already exists. If yes, skip write or overwrite based on a feature flag.
-* **DLQs**: Configure an SQS DLQ for both Lambdas. Add an EventBridge rule for Transcribe `FAILED` to a notifier Lambda that posts to email/Slack.
-* **Transcribe output role**: If required in your account, create a Transcribe data-access role that allows PutObject to the results bucket prefix `tmp/<tenant_id>/` and trust `transcribe.amazonaws.com`.
+* Handles audio from any tenant via deterministic `tenant_id` derivation.
+* Encrypted with KMS.
+* Errors and retries logged in CloudWatch.
+
+---
+
+## 7.3 cci-lite-result-handler — Transcribe → NLP → QA → Unified JSON
+
+| Property    | Value                                             |
+| ----------- | ------------------------------------------------- |
+| **Trigger** | SQS (`cci-lite-analysis-queue`) subscribed to SNS |
+| **Timeout** | 10 minutes                                        |
+| **Memory**  | 1536 MB                                           |
+
+**Logic**
+
+1. Reads message payload from SQS (subscription from Transcribe).
+2. Fetches tenant QA template from DynamoDB (`cci-lite-config`).
+3. Downloads transcript JSON from S3 results path.
+4. Performs NLP and QA evaluation using Bedrock (`anthropic.claude-3-haiku-20240307`).
+5. Merges results into a unified JSON document with sentiment, tone, QA scores, and metadata.
+6. Writes enriched JSON to `cci-lite-results-<accountid>-eu-central-1/<tenant_id>/YYYY/MM/DD/`.
+7. Deletes message from SQS after successful processing.
+
+**Notes**
+
+* Implements retry + back-off for transcript availability.
+* Maintains deterministic `call_id` based on job name for idempotency.
+* Fully encrypted via CMK.
+* Optional: Forward summary to notification webhook (Slack/Teams).
+
+---
+
+## 7.4 Production Hardening (Integrated into Handler)
+
+| Concern                     | Mitigation                                                                                      |
+| --------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Transcript availability** | Poll `results/tmp/<tenant_id>/` for ≤ 45 s after completion; fail cleanly if not found.         |
+| **JSON repair**             | If Bedrock returns malformed JSON, strip control chars and re-parse; fallback to `summary_raw`. |
+| **Idempotency**             | Use `TranscriptionJobName` or `call_id`; skip if output already exists.                         |
+| **Error recovery**          | Failed messages auto-redirect to `cci-lite-dlq`; monitor with CloudWatch metrics.               |
+| **Scaling safety**          | Reserved concurrency and SQS buffer prevent SNS burst failures.                                 |
+| **Security**                | All data KMS-encrypted; no PII stored beyond transcript text.                                   |
+
+---
+
+### ✅ Outcome
+
+Both Lambdas (`cci-lite-job-init` and `cci-lite-result-handler`) operate within a fully event-driven, KMS-encrypted pipeline:
+
+```
+S3 → Lambda(job-init) → Transcribe → SNS → SQS → Lambda(result-handler) → S3(results)
+```
+
+This configuration replaces EventBridge completely and is production-ready for CCI Lite Alpha/Pilot deployments.
 
 ---
 

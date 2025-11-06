@@ -6,7 +6,7 @@
 
 ### Region
 
-`eu-central-1` (core) — Bedrock calls use `us-east-1` if model requires
+`eu-central-1` (core) — Bedrock calls use `eu-central-1` if model requires
 
 ### Environment
 

@@ -11,7 +11,7 @@
 * **Region**: `eu-central-1` for core. Bedrock calls in `us-east-1` if required by model.
 * **Tenant example**: `demo-tenant`
 * **Buckets**: `cci-lite-input-<accountid>-eu-central-1`, `cci-lite-results-<accountid>-eu-central-1`, `cci-lite-athena-staging-<accountid>-eu-central-1`
-* **KMS key**: `alias/cci-lite-master-key`
+* **KMS key**: `alias/cci-lite-master-key`, `arn:aws:kms:eu-central-1:591338347562:key/79d23f7f-9420-4398-a848-93876d0250e5`
 * **Roles**: `cci-lite-lambda-role`, `cci-lite-glue-role`, `cci-lite-quicksight-role`
 * **Lambdas**: `cci-lite-job-init`, `cci-lite-result-handler` (optionally `cci-lite-analyzer` for SQS)
 * **SNS Topic**: `TranscribeJobStatusTopic`

@@ -16,29 +16,29 @@ Production
 
 ## 1. Purpose
 
-This phase establishes the **Amazon SNS topic** that notifies Lambda when an Amazon Transcribe job completes. The topic is encrypted with the same customer-managed KMS key to maintain data security and multi-tenant isolation. It will be used in subsequent phases by the Lambda functions (`cci-lite-job-init` and `cci-lite-result-handler`).
+This phase establishes the **Amazon SNS topic** that notifies the Lambda result handler when an Amazon Transcribe job completes. The topic is now a **Standard SNS topic** (not FIFO) to ensure compatibility with Amazon Transcribe notifications and Lambda subscriptions. The topic remains encrypted with the same customer-managed KMS key for consistency and tenant data protection.
 
 ---
 
 ## 2. SNS Configuration
 
-**Topic Name:** `TranscribeJobStatusTopic.fifo`
-**Type:** FIFO (First-In-First-Out)
+**Topic Name:** `TranscribeJobStatusTopic`
+**Type:** Standard
 **Encryption:** Customer-managed KMS → `alias/cci-lite-master-key`
 **Region:** eu-central-1
 **Tags:**
 `Project=CCI-Lite`, `Environment=Production`, `Version=v1.3`, `Region=eu-central-1`
 
 **Topic ARN:**
-`arn:aws:sns:eu-central-1:591338347562:TranscribeJobStatusTopic.fifo`
+`arn:aws:sns:eu-central-1:591338347562:TranscribeJobStatusTopic`
 
 ---
 
 ## 3. IAM Role Updates
 
-The `cci-lite-lambda-role` was updated to include permissions for publishing and subscribing to the SNS topic.
+The `cci-lite-lambda-role` was updated to include minimal permissions for publishing to the SNS topic if required (for example, when a job initiation function needs to send a status message). SNS **invocation of Lambda** is handled via a **subscription**, so `sns:Subscribe` and `sns:Receive` are not required for the Lambda itself.
 
-### Updated SNS Access Policy
+### Updated SNS Access Policy (optional)
 
 ```json
 {
@@ -46,17 +46,15 @@ The `cci-lite-lambda-role` was updated to include permissions for publishing and
   "Effect": "Allow",
   "Action": [
     "sns:Publish",
-    "sns:Subscribe",
     "sns:GetTopicAttributes",
     "sns:SetTopicAttributes",
-    "sns:ListSubscriptionsByTopic",
-    "sns:Unsubscribe"
+    "sns:ListSubscriptionsByTopic"
   ],
-  "Resource": "arn:aws:sns:eu-central-1:591338347562:TranscribeJobStatusTopic.fifo"
+  "Resource": "arn:aws:sns:eu-central-1:591338347562:TranscribeJobStatusTopic"
 }
 ```
 
-This block ensures Lambda can both publish messages (when initiating Transcribe jobs) and receive notifications (once subscribed in the result handler stage).
+> Note: This block can be omitted entirely if the Lambda only **receives** messages from SNS (i.e., is subscribed). The permission is only necessary if the Lambda **publishes** messages to this topic.
 
 ---
 
@@ -64,7 +62,7 @@ This block ensures Lambda can both publish messages (when initiating Transcribe 
 
 * **Encryption Key:** `arn:aws:kms:eu-central-1:591338347562:key/79d23f7f-9420-4398-a848-93876d0250e5`
 * **Alias:** `alias/cci-lite-master-key`
-* The key policy already authorizes SNS service access, no changes required.
+* The key policy already authorizes the `sns.amazonaws.com` service principal. No additional entries are needed.
 
 ---
 
@@ -73,7 +71,7 @@ This block ensures Lambda can both publish messages (when initiating Transcribe 
 | Check                                      | Result |
 | ------------------------------------------ | ------ |
 | SNS Topic created                          | ✅      |
-| FIFO suffix (`.fifo`) confirmed            | ✅      |
+| Topic Type = Standard                      | ✅      |
 | Encryption key applied                     | ✅      |
 | IAM permissions for Lambda updated         | ✅      |
 | Region alignment                           | ✅      |
@@ -83,24 +81,23 @@ This block ensures Lambda can both publish messages (when initiating Transcribe 
 
 ## 6. Outputs / Notes
 
-* SNS topic now acts as the **event bridge** between Amazon Transcribe and Lambda.
-* All encryption remains centralized under the same KMS key.
-* The Lambda subscriber will be added during the **Result Handler** phase.
-* Optional (future): add DLQ (SQS FIFO) or CloudWatch delivery status logging for fault tolerance.
+* SNS topic now acts as the **event bridge** between Amazon Transcribe and the Lambda result handler (to be created in a later phase).
+* Using a **Standard** topic ensures Amazon Transcribe can publish completion events successfully.
+* Encryption remains consistent under the single CMK.
+* Lambda subscription will be created once the result handler function exists.
+* Optional (future): add DLQ (SQS Standard) or CloudWatch delivery logging for reliability.
 
 ---
 
 ## 7. Next Phase
 
-Proceed to **Phase 6 — Glue / Athena Integration**
+Proceed to **Phase 6 — EventBridge and Lambda Integration**
 Tasks:
 
-* Create Glue Database: `cci-lite-db`
-* Create Glue Crawler: `cci-lite-results-crawler`
-* Target: `s3://cci-lite-results-<accountid>-eu-central-1/demo-tenant/`
-* Assign Role: `cci-lite-glue-role`
-* Run crawler once to build Athena tables for QuickSight.
+* Deploy `cci-lite-job-init` Lambda to start Transcribe jobs.
+* Deploy `cci-lite-result-handler` Lambda to process completed jobs.
+* Subscribe `cci-lite-result-handler` to this SNS topic once deployed.
 
 ---
 
-*End of Phase 5 update.*
+*End of updated Phase 5 (SNS) documentation — aligned with Standard topic configuration and current infrastructure.*

@@ -35,13 +35,127 @@ All subsequent components (Lambda, Transcribe, Glue, Athena) depend on these enc
 * Policy includes root + admin + AWS service principals (Lambda, Glue, QuickSight, Transcribe, EventBridge, S3).
 * Tenant guard condition reserved for future isolation enforcement:
 
-  ```json
-  "Condition": {
-    "StringEquals": {
-      "kms:EncryptionContext:tenant_id": "${aws:PrincipalTag/tenant_id}"
+```json
+{
+  "Version": "2012-10-17",
+  "Id": "cci-lite-master-key-policy-v1.1",
+  "Statement": [
+    {
+      "Sid": "AllowRootAccountFullAccess",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::591338347562:root" },
+      "Action": "kms:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowKeyAdministrators",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::591338347562:role/Admin",
+          "arn:aws:iam::591338347562:role/CCIPlatformAdmin"
+        ]
+      },
+      "Action": [
+        "kms:Create*",
+        "kms:Describe*",
+        "kms:Enable*",
+        "kms:List*",
+        "kms:Put*",
+        "kms:Update*",
+        "kms:Revoke*",
+        "kms:Disable*",
+        "kms:Get*",
+        "kms:Delete*",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowCoreServiceRolesToUseKey",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::591338347562:role/cci-lite-lambda-role",
+          "arn:aws:iam::591338347562:role/cci-lite-glue-role",
+          "arn:aws:iam::591338347562:role/cci-lite-quicksight-role",
+          "arn:aws:iam::591338347562:role/service-role/AmazonTranscribeServiceRole"
+        ]
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowAWSServiceAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "lambda.amazonaws.com",
+          "glue.amazonaws.com",
+          "quicksight.amazonaws.com",
+          "events.amazonaws.com",
+          "transcribe.amazonaws.com",
+          "s3.amazonaws.com"
+        ]
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "TenantScopedEncryptionContext",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::591338347562:role/cci-lite-lambda-role"
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:EncryptionContext:tenant_id": "${aws:PrincipalTag/tenant_id}"
+        }
+      }
+    },
+    {
+      "Sid": "AllowCloudWatchLogsAndEventBridgeAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "logs.eu-central-1.amazonaws.com",
+          "events.amazonaws.com"
+        ]
+      },
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey"
+      ],
+      "Resource": "*"
     }
-  }
-  ```
+  ]
+}
+```
+
 * Tag set applied:
 
   ```
